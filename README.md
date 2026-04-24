@@ -133,7 +133,7 @@ source .venv/bin/activate     # macOS / Linux
 
 ### 3. Install dependencies
 ```bash
-pip install streamlit yfinance scikit-learn xgboost statsmodels plotly pandas numpy
+pip install -r requirements.txt
 ```
 
 ### 4. Run the app
