@@ -1,169 +1,31 @@
+"""
+Gold Price Prediction Dashboard
+Main application orchestrating all modules
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
-import matplotlib.pyplot as plt
 import plotly.graph_objects as go
-import plotly.express as px
-from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestRegressor
-from xgboost import XGBRegressor
-from sklearn.metrics import r2_score
-from statsmodels.tsa.stattools import coint
 from datetime import datetime, timedelta
+from sklearn.metrics import r2_score
 import warnings
+
 warnings.filterwarnings('ignore')
 
-st.set_page_config(page_title="🥇 Gold Price Predictor", layout="wide", initial_sidebar_state="expanded")
+# Import from modules
+from ui import configure_page, apply_custom_css, initialize_session_state, sidebar_header, refresh_data_button, train_model_button
+from models import load_data, train_model
+from features import prepare_features
+from analysis import get_cointegration_stats
 
-# Initialize session state for model training control
-for _key, _default in [
-    ('model_trained', False),
-    ('train_triggered', False),
-    ('cached_model', None),
-    ('cached_data', None),
-    ('cached_model_type', 'Linear Regression'),
-]:
-    if _key not in st.session_state:
-        st.session_state[_key] = _default
+# ==================== PAGE CONFIGURATION ====================
+configure_page()
+apply_custom_css()
+initialize_session_state()
 
-# Custom CSS
-st.markdown("""
-    <style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-    .signal-buy {
-        background-color: #d4edda;
-        color: #155724;
-    }
-    .signal-no {
-        background-color: #fff3cd;
-        color: #856404;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-# ==================== DATA LOADING & PROCESSING ====================
-@st.cache_data
-def load_data(start_date, end_date):
-    """Load GLD data from yfinance"""
-    try:
-        # Add 5 days buffer to end_date to ensure we get the most recent available data
-        end_date_buffer = end_date + timedelta(days=5)
-        data = yf.download('GLD', start=start_date.strftime('%Y-%m-%d'), 
-                          end=end_date_buffer.strftime('%Y-%m-%d'), auto_adjust=True, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.droplevel(1)
-        # Filter to end_date just to be safe (in case we got extra future dates)
-        data = data[data.index <= end_date]
-        return data[['Close']].dropna()
-    except Exception as e:
-        st.error(f"Error loading data: {e}")
-        return None
-
-@st.cache_data
-def prepare_features(df, ma_short, ma_long, days_ahead=1):
-    """Prepare features for modeling.
-    Always computes both raw and normalised columns so any model can use them.
-    """
-    df_copy = df.copy()
-    df_copy['S_short'] = df_copy['Close'].rolling(window=ma_short).mean()
-    df_copy['S_long']  = df_copy['Close'].rolling(window=ma_long).mean()
-
-    # Absolute target  (Linear Regression)
-    df_copy['target_price'] = df_copy['Close'].shift(-days_ahead)
-
-    # --- Normalised features (scale-invariant for tree models) ---
-    # Ratios hover near 1.0 regardless of the price level → no extrapolation issue
-    df_copy['S_short_norm'] = df_copy['S_short'] / df_copy['Close']
-    df_copy['S_long_norm']  = df_copy['S_long']  / df_copy['Close']
-
-    # Ratio target: next_price / current_price  (tree models predict this)
-    df_copy['target_ratio'] = df_copy['Close'].shift(-days_ahead) / df_copy['Close']
-
-    return df_copy.dropna()
-
-def train_model(df, ma_short, ma_long, split_ratio, days_ahead=1, model_type='Linear Regression'):
-    """Train the selected model.
-
-    Linear Regression  → raw price features + absolute price target.
-    XGBoost / RF       → normalised ratio features + ratio target
-                         (scale-invariant, fixes the extrapolation problem).
-    """
-    df_prepared = prepare_features(df, ma_short, ma_long, days_ahead)
-    split_idx   = int(len(df_prepared) * split_ratio)
-
-    if model_type in ('XGBoost', 'Random Forest'):
-        # Normalised features: always near 1.0 regardless of price level
-        feature_cols = ['S_short_norm', 'S_long_norm']
-        use_ratio    = True
-        X = df_prepared[feature_cols]
-        y = df_prepared['target_ratio']          # predict next/current ratio
-    else:
-        feature_cols = ['S_short', 'S_long']
-        use_ratio    = False
-        X = df_prepared[feature_cols]
-        y = df_prepared['target_price']
-
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-
-    if model_type == 'XGBoost':
-        model = XGBRegressor(
-            n_estimators=300,
-            learning_rate=0.03,
-            max_depth=4,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            min_child_weight=5,
-            random_state=42,
-            verbosity=0
-        ).fit(X_train, y_train,
-              eval_set=[(X_test, y_test)],
-              verbose=False)
-    elif model_type == 'Random Forest':
-        model = RandomForestRegressor(
-            n_estimators=300,
-            max_depth=8,
-            min_samples_split=5,
-            min_samples_leaf=3,
-            random_state=42,
-            n_jobs=-1
-        ).fit(X_train, y_train)
-    else:
-        model = LinearRegression().fit(X_train, y_train)
-
-    return model, X_train, X_test, y_train, y_test, df_prepared, split_idx, feature_cols, use_ratio
-
-def get_cointegration_stats(df, ma_short, ma_long, days_ahead=1):
-    """Calculate cointegration statistics"""
-    df_prepared = prepare_features(df, ma_short, ma_long, days_ahead)
-    
-    s_short = df_prepared['S_short'].dropna()
-    s_long = df_prepared['S_long'].dropna()
-    target_price = df_prepared['target_price'].dropna()
-    
-    # Ensure same length
-    min_len = min(len(s_short), len(s_long), len(target_price))
-    s_short, s_long, target_price = s_short[-min_len:], s_long[-min_len:], target_price[-min_len:]
-    
-    coint_short = coint(s_short, target_price)
-    coint_long = coint(s_long, target_price)
-    
-    return {
-        'short_pvalue': coint_short[1],
-        'long_pvalue': coint_long[1],
-        'short_stat': coint_short[0],
-        'long_stat': coint_long[0]
-    }
 
 # ==================== SIDEBAR CONFIGURATION ====================
-st.sidebar.header("⚙️ Configuration")
-st.sidebar.markdown("---")
+sidebar_header()
 
 # Training data period in expander
 with st.sidebar.expander("📅 Training Data Period", expanded=False):
@@ -196,16 +58,10 @@ with st.sidebar.expander("⚙️ Model Parameters", expanded=False):
     train_split = st.slider("Train/Test Split", 0.5, 0.95, 0.8)
 
 # Train Model button
-if st.sidebar.button("🚀 Train Model", use_container_width=True, help="Click to train/retrain the model with current parameters"):
-    st.session_state.train_triggered = True
+train_model_button()
 
-# Initialize session state (kept for backward compatibility)
-if 'train_triggered' not in st.session_state:
-    st.session_state.train_triggered = False
-
-# Auto-train on first load if model hasn't been trained yet
-if not st.session_state.model_trained and not st.session_state.train_triggered:
-    st.session_state.train_triggered = True
+# Refresh data button
+refresh_data_button()
 
 # ==================== MAIN DASHBOARD ====================
 st.title("🥇 Gold Price Prediction Dashboard")
